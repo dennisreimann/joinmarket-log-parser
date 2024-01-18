@@ -202,20 +202,23 @@ async function processFile(filePath) {
       case 'utxos_removed':
         const { outpoint } = entry.utxos[0]
         const removeDate = Object.keys(acc).find(key =>
-          acc[key].find(e => e.type === 'tx_obtained' &&  e.inputs.find(i => i.outpoint === outpoint)));
+          acc[key].find(e => e.type === 'tx_obtained' &&  e.inputs.find(i => i.outpoint === outpoint)) &&
+          !acc[key].find(e => e.type === 'utxos_removed'))
         if (removeDate) date = removeDate
         break
 
       case 'utxos_added':
         const { address } = entry.utxos[0]
         const addDate = Object.keys(acc).find(key =>
-          acc[key].find(e => e.type === 'cj_info' && (e.cjaddr === address || e.change === address)));
+          acc[key].find(e => e.type === 'cj_info' && (e.cjaddr === address || e.change === address)) &&
+          !acc[key].find(e => e.type === 'utxos_added'))
         if (addDate) date = addDate
 
       case 'tx_confirmed':
         const blockHash = entry.block
         const confDate = Object.keys(acc).find(key =>
-          acc[key].find(e => e.type === 'utxos_added' && (e.utxos.find(u => u.outpoint.startsWith(blockHash)))));
+          acc[key].find(e => e.type === 'utxos_added' && (e.utxos.find(u => u.outpoint.startsWith(blockHash)))) &&
+          !acc[key].find(e => e.type === 'tx_confirmed'))
         if (confDate) date = confDate
         break
 
@@ -268,4 +271,66 @@ async function processFile(filePath) {
   }, {})
   // write result
   await writeFile('joinmarket.json', JSON.stringify(byDate, null, 2))
+
+  // BIP 329 labels
+  // { "type": "tx", "ref": "52a8a8317c8836ad11e0a3402196db97bdac51566739b8a2d4dff526edb7fd5d", "label": "cj" }
+  // { "type": "addr", "ref": "bc1q34aq5drpuwy3wgl9lhup9892qp6svr8ldzyy7c", "label": "Address" }
+  // { "type": "input", "ref": "f91d0a8a78462bc59398f2c5d7a84fcff491c26ba54c4833478b202796c8aafd:0", "label": "Input" }
+  // { "type": "output", "ref": "f91d0a8a78462bc59398f2c5d7a84fcff491c26ba54c4833478b202796c8aafd:1", "label": "Output" , "spendable" : "false" }
+
+  const bip329 = Object.values(byDate).reduce((acc, entries) => {
+    const fillingOffer = entries.find(entry => entry.type === 'filling_offer')
+    const sendingOutput = entries.find(entry => entry.type === 'sending_output')
+    const chosenOrders = entries.find(entry => entry.type === 'chosen_orders')
+    const txSend = entries.find(entry => entry.type === 'tx_send')
+    const scheduleItem = entries.find(entry => entry.type === 'schedule_item')
+    const utxosAdded = entries.find(entry => entry.type === 'utxos_added')
+    const utxosRemoved = entries.find(entry => entry.type === 'utxos_removed')
+    const cjInfo = entries.find(entry => entry.type === 'cj_info')
+
+    const fundingLabel = 'Funding'
+    let cjLabel = ''
+    if (fillingOffer && utxosAdded) {
+      cjLabel = `Mixdepth ${fillingOffer.mixdepth} Maker`
+      acc.push({ type: 'tx', ref: utxosAdded.utxos[0].outpoint.split(':')[0], label: cjLabel })
+    } else if (utxosRemoved && txSend) {
+      const md = scheduleItem && scheduleItem.mixdepth
+      cjLabel = `Mixdepth${md ? ` ${md}` : ''} Taker`
+      acc.push({ type: 'tx', ref: txSend.txid, label: cjLabel })
+    }
+    if (cjInfo) {
+      acc.push({ type: 'addr', ref: cjInfo.cjaddr, label: (cjLabel + ' Coinjoined').trim() })
+      acc.push({ type: 'addr', ref: cjInfo.change, label: (cjLabel + ' Change').trim() })
+    }
+    if (utxosAdded) {
+      if (cjInfo) {
+        utxosAdded.utxos.forEach(utxo => {
+          acc.push({ type: 'output', ref: utxo.outpoint, label: utxo.address === cjInfo.cjaddr ? (cjLabel + ' Coinjoined').trim() : (cjLabel + ' Change').trim() })
+        })
+      } else {
+        utxosAdded.utxos.forEach(utxo => {
+          acc.push({ type: 'output', ref: utxo.outpoint, label: fundingLabel })
+        })
+      }
+    }
+    if (utxosRemoved) {
+      if (cjInfo) {
+        utxosRemoved.utxos.forEach(utxo => {
+          const prevOutput = acc.find(e => e.type === 'output' &&  e.ref === utxo.outpoint && e.label != fundingLabel)
+          const thisLabel = (cjLabel + ' Coinjoined').trim()
+          const label = prevOutput ? [prevOutput.label, thisLabel].join(', ') : thisLabel
+          acc.push({ type: 'input', ref: utxo.outpoint, label })
+        })
+      } else {
+        utxosRemoved.utxos.forEach(utxo => {
+          const prevOutput = acc.find(e => e.type === 'output' &&  e.ref === utxo.outpoint && e.label != fundingLabel)
+          const thisLabel = 'Withdrawal'
+          const label = prevOutput ? [prevOutput.label, thisLabel].join(', ') : thisLabel
+          acc.push({ type: 'input', ref: utxo.outpoint, label })
+        })
+      }
+    }
+    return acc
+  }, []).map(JSON.stringify).join('\n')
+  await writeFile('joinmarket-bip329.json', bip329)
 })()
