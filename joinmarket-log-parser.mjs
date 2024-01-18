@@ -4,14 +4,21 @@ import { createInterface } from 'readline'
 import path from 'path'
 
 // read directory from argv
-const directoryPath = process.argv[2];
-const output = process.argv[3] || 'joinmarket.json'
+const directoryPath = process.argv[2]
 
 // events
 const getInfo = line => {
   if (line.startsWith('Added utxos=')) return { type: 'utxos_added', content: '' }
   else if (line.startsWith('Removed utxos=')) return { type: 'utxos_removed', content: '' }
+  else if (line.startsWith('chosen orders =')) return { type: 'chosen_orders', content: '' }
+  else if (line.startsWith('cj amount =')) return { type: 'cj_amount', content: line }
+  else if (line.startsWith('total cj fee =')) return { type: 'cj_fee', content: line }
+  else if (line.startsWith('total coinjoin fee =')) return { type: 'cj_fee', content: line }
   else if (line.startsWith('obtained tx')) return { type: 'tx_obtained', content: '' }
+  else if (line.startsWith('txid = ')) return { type: 'tx_send', content: line }
+  else if (line.startsWith('schedule item was: ')) return { type: 'schedule_item', content: line }
+  else if (line.startsWith('filling offer')) return { type: 'filling_offer', content: line }
+  else if (line.startsWith('sending output to address=')) return { type: 'sending_output', content: line }
   else if (line.startsWith('tx in a block')) return { type: 'tx_confirmed', content: line }
   else if (line.startsWith('potentially earned')) return { type: 'cj_earned', content: line }
   else if (line.startsWith('mycjaddr, mychange')) return { type: 'cj_info', content: line }
@@ -29,6 +36,7 @@ async function processFile(filePath) {
     if (info) {
       const l = result.push({ date: new Date(m[1]), ...info })
       entry = result[l-1]
+      entry.file = path.basename(filePath)
     } else if (m && info == null) {
       entry = null
     } else if (entry != null) {
@@ -38,7 +46,7 @@ async function processFile(filePath) {
   return result
 }
 
-(async function() {
+;(async function() {
   // get and process files
   const files = await readdir(directoryPath)
   const promises = files.map(file => processFile(path.join(directoryPath, file)))
@@ -47,6 +55,30 @@ async function processFile(filePath) {
   const results = allResults.flat().sort((a, b) => a.date - b.date).map(entry => {
     let content = entry.content.trim()
     switch (entry.type) {
+      case 'chosen_orders':
+        entry.orders = JSON.parse(`[${content.replace(/'/g, '"').replace(/[\s\S]\{/g, ',{')}]`)
+        delete entry.content
+        break
+
+      case 'cj_amount':
+        const amt = content.match(/cj amount = (\w+)/)
+        if (amt) {
+          entry.amount_sats = parseInt(amt[1])
+          delete entry.content
+        }
+        break
+
+      case 'cj_fee':
+        const fee = content.match(/ = (.*)/)
+        if (fee) {
+          if (fee[1].endsWith('%'))
+            entry.fee_percent = fee[1]
+          else
+            entry.fee_sats = parseInt(fee[1])
+          delete entry.content
+        }
+        break
+
       case 'tx_obtained':
         if (content.startsWith('[') || content.startsWith('{')) {
           try {
@@ -74,6 +106,31 @@ async function processFile(filePath) {
           } catch(e) {
             console.error(e, content)
           }
+        }
+        break
+
+      case 'tx_send':
+        const info = content.match(/txid = (\w+)/)
+        if (info) {
+          entry.txid = info[1]
+          delete entry.content
+        }
+        break
+
+      case 'filling_offer':
+        const offer = content.match(/filling offer, mixdepth=(\d+), amount=(\d+)/)
+        if (offer) {
+          entry.mixdepth = parseInt(offer[1])
+          entry.amount_sats = parseInt(offer[2])
+          delete entry.content
+        }
+        break
+
+      case 'sending_output':
+        const output = content.match(/sending output to address=(\w+)/)
+        if (output) {
+          entry.to_address = output[1]
+          delete entry.content
         }
         break
 
@@ -109,6 +166,18 @@ async function processFile(filePath) {
         }
         break
 
+      case 'schedule_item':
+        const schedule = content.match(/schedule item was: (\[.*\])/)
+        if (schedule) {
+          const [mixdepth, amount, counterparties, to_address] = JSON.parse(schedule[1].replace(/'/g, '"'))
+          entry.mixdepth = mixdepth
+          entry.amount_sats = amount
+          entry.counterparties = counterparties
+          entry.to_address = to_address
+          delete entry.content
+        }
+        break
+
       case 'tx_confirmed':
         const blockinfo = content.match(/tx in a block: (\w+) with (\d+) confirmations/)
         if (blockinfo) {
@@ -125,6 +194,7 @@ async function processFile(filePath) {
     return entry
   })
   // aggregate by date and join related entries
+  let prev = null
   const byDate = results.reduce((acc, entry) => {
     let date = entry.date.toISOString()
     switch (entry.type) {
@@ -149,14 +219,53 @@ async function processFile(filePath) {
         if (confDate) date = confDate
         break
 
-      default:
-        delete entry.date
+      case 'sending_output':
+        if (prev.type == 'filling_offer') {
+          entry.date = prev.date
+          date = entry.date.toISOString()
+        }
+        break
+
+      case 'tx_obtained':
+        if (['sending_output', 'filling_offer', 'cj_fee', 'cj_amount', 'chosen_orders'].includes(prev.type)) {
+          entry.date = prev.date
+          date = entry.date.toISOString()
+        }
+        break
+
+      case 'cj_earned':
+        if (['utxos_removed', 'tx_obtained'].includes(prev.type)) {
+          entry.date = prev.date
+          date = entry.date.toISOString()
+        }
+        break
+
+      case 'cj_info':
+        if (['cj_earned', 'tx_obtained'].includes(prev.type)) {
+          entry.date = prev.date
+          date = entry.date.toISOString()
+        }
+        break
+
+      case 'schedule_item':
+        if (['utxos_removed', 'tx_obtained'].includes(prev.type)) {
+          entry.date = prev.date
+          date = entry.date.toISOString()
+        }
+        break
+
+      case 'tx_send':
+        if (['schedule_item'].includes(prev.type)) {
+          entry.date = prev.date
+          date = entry.date.toISOString()
+        }
         break
     }
     if (acc[date] == null) acc[date] = []
     acc[date].push(entry)
+    prev = entry
     return acc
   }, {})
   // write result
-  await writeFile(output, JSON.stringify(byDate, null, 2))
+  await writeFile('joinmarket.json', JSON.stringify(byDate, null, 2))
 })()

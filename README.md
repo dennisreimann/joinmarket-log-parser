@@ -10,5 +10,5 @@ Requirements:
 Usage:
 
 ```bash
-node joinmarket-log-parser.mjs ./logs joinmarket.json
+node joinmarket-log-parser.mjs ./logs
 ```
